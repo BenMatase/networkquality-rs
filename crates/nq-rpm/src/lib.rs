@@ -116,7 +116,7 @@ impl Responsiveness {
             } else if no_tls {
                 // In no-tls (plain HTTP) mode, use reduced synthetic upload size to avoid
                 // extremely long single-connection uploads and exercise self-probe behavior.
-                Direction::Up(std::cmp::min(1600u64 * 1024 * 1024, usize::MAX as u64) as usize)
+                Direction::Up(std::cmp::min(160u64 * 1024 * 1024, usize::MAX as u64) as usize)
             } else {
                 // HTTPS path: preserve original behavior (large upload). 4GB is set in load config.
                 Direction::Up(4_000_000_000usize.min(usize::MAX))
@@ -301,7 +301,35 @@ impl Responsiveness {
         if self.load_generator.count_loads() < self.config.max_loaded_connections
             && interval % 2 == 0
         {
-            self.new_load_generating_connection(event_tx, env, shutdown)?;
+            self.new_load_generating_connection(event_tx, env, shutdown.clone())?;
+        }
+
+        // Restart any finished upload connections to keep sustained upstream load.
+        // This avoids idle periods after a single large body completes (e.g., Cloudflare 413 limiting size).
+        for load in self.load_generator.loads_mut().iter_mut() {
+            if load.is_finished_upload() {
+                // Use original configured upload size (may have been reduced for no_tls).
+                let size = match self.direction { Direction::Up(sz) => sz, _ => continue };
+                match load.restart_upload(
+                    Arc::clone(&env.network),
+                    Arc::clone(&env.time),
+                    shutdown.clone(),
+                    &self.config.upload_url,
+                    size,
+                    self.config.no_tls,
+                ) {
+                    Ok(fut) => {
+                        if let Err(e) = fut.await {
+                            error!("error restarting upload: {e}");
+                        } else {
+                            debug!("restarted finished upload connection");
+                        }
+                    }
+                    Err(e) => {
+                        error!("unable to initiate upload restart: {e}");
+                    }
+                }
+            }
         }
 
         let current_goodput = self.current_average_throughput(end_data_interval);

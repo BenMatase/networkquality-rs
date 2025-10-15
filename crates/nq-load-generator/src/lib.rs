@@ -95,6 +95,8 @@ impl LoadGenerator {
                     events_rx: inflight_body.events,
                     total_bytes_series: CounterSeries::new(),
                     finished_at: None,
+                    direction,
+                    bytes_transferred_total: 0,
                 }));
 
                 Ok::<_, anyhow::Error>(())
@@ -151,6 +153,7 @@ impl LoadGenerator {
     pub fn into_connections(self) -> Vec<LoadedConnection> {
         self.loads
     }
+
 }
 
 #[derive(Debug)]
@@ -159,14 +162,25 @@ pub struct LoadedConnection {
     events_rx: UnboundedReceiver<BodyEvent>,
     total_bytes_series: CounterSeries,
     finished_at: Option<Timestamp>,
+    direction: Direction,
+    /// Cumulative bytes transferred across restarts (for uploads only).
+    bytes_transferred_total: usize,
 }
 
 impl LoadedConnection {
     pub fn update(&mut self) {
         while let Ok(event) = self.events_rx.try_recv() {
             match event {
-                BodyEvent::ByteCount { at, total } => self.total_bytes_series.add(at, total as f64),
-                BodyEvent::Finished { at } => self.finished_at = Some(at),
+                BodyEvent::ByteCount { at, total } => {
+                    self.total_bytes_series.add(at, total as f64);
+                    // Track cumulative upload bytes across restarts so capacity calc remains accurate.
+                    if matches!(self.direction, Direction::Up(_)) {
+                        self.bytes_transferred_total = total; // last reported total for current run
+                    }
+                }
+                BodyEvent::Finished { at } => {
+                    self.finished_at = Some(at);
+                }
             }
         }
     }
@@ -179,4 +193,36 @@ impl LoadedConnection {
         self.events_rx.close();
         self.update();
     }
+
+    pub fn is_finished_upload(&self) -> bool {
+        self.finished_at.is_some() && matches!(self.direction, Direction::Up(_))
+    }
+
+    pub fn restart_upload(
+        &mut self,
+        network: Arc<dyn Network>,
+        time: Arc<dyn Time>,
+        shutdown: CancellationToken,
+        url: &url::Url,
+        size: usize,
+        no_tls: bool,
+    ) -> anyhow::Result<impl std::future::Future<Output = anyhow::Result<()>> + '_> {
+        self.finished_at = None;
+        let uri = url.as_str().parse()?;
+        let client = ThroughputClient::upload(size)
+            .plain_http_mode(no_tls)
+            .with_connection(self.connection.clone());
+        let response_fut = client.send(uri, network, time, shutdown)?;
+        Ok(async move {
+            let inflight_body = response_fut.await?;
+            self.events_rx = inflight_body.events;
+            Ok(())
+        })
+    }
+}
+
+impl LoadGenerator {
+    /// Mutable access to internal loads vector for management (e.g., restarts).
+    pub fn loads_mut(&mut self) -> &mut Vec<LoadedConnection> { &mut self.loads }
+    pub fn config(&self) -> &LoadConfig { &self.config }
 }
