@@ -116,7 +116,7 @@ impl Responsiveness {
             } else if no_tls {
                 // In no-tls (plain HTTP) mode, use reduced synthetic upload size to avoid
                 // extremely long single-connection uploads and exercise self-probe behavior.
-                Direction::Up(std::cmp::min(160u64 * 1024 * 1024, usize::MAX as u64) as usize)
+                Direction::Up(std::cmp::min(1600u64 * 1024 * 1024, usize::MAX as u64) as usize)
             } else {
                 // HTTPS path: preserve original behavior (large upload). 4GB is set in load config.
                 Direction::Up(4_000_000_000usize.min(usize::MAX))
