@@ -34,7 +34,8 @@ pub struct ResponsivenessConfig {
     pub trimmed_mean_percent: f64,
     pub std_tolerance: f64,
     pub max_loaded_connections: usize,
-    pub no_tls: bool,
+    pub no_tls_download: bool,
+    pub no_tls_upload: bool,
 }
 
 impl ResponsivenessConfig {
@@ -47,7 +48,8 @@ impl ResponsivenessConfig {
             // When running in --no-tls mode we override this later when constructing the
             // Responsiveness instance for uploads.
             upload_size: 4_000_000_000, // 4 GB (legacy default)
-            no_tls: self.no_tls,
+            // Load-generating connections issue downloads first; use download flag.
+            no_tls: self.no_tls_download,
         }
     }
 }
@@ -70,7 +72,8 @@ impl Default for ResponsivenessConfig {
             trimmed_mean_percent: 0.95,
             std_tolerance: 0.05,
             max_loaded_connections: 16,
-            no_tls: false,
+            no_tls_download: false,
+            no_tls_upload: false,
         }
     }
 }
@@ -95,10 +98,11 @@ pub struct Responsiveness {
 
 impl Responsiveness {
     fn connection_type(&self) -> ConnectionType {
-        if self.config.no_tls { ConnectionType::H1 } else { ConnectionType::H2 }
+        // Connection type determined by download path (GETs / probes)
+        if self.config.no_tls_download { ConnectionType::H1 } else { ConnectionType::H2 }
     }
     pub fn new(config: ResponsivenessConfig, download: bool) -> anyhow::Result<Self> {
-        let no_tls = config.no_tls; // capture before move
+        let no_tls_upload = config.no_tls_upload; // used for direction logic
         let load_generator = LoadGenerator::new(config.load_config())?;
 
         Ok(Self {
@@ -113,12 +117,11 @@ impl Responsiveness {
             rpm_saturated: false,
             direction: if download {
                 Direction::Down
-            } else if no_tls {
-                // In no-tls (plain HTTP) mode, use reduced synthetic upload size to avoid
-                // extremely long single-connection uploads and exercise self-probe behavior.
+            } else if no_tls_upload {
+                // Plain HTTP upload path: reduced synthetic upload size.
                 Direction::Up(std::cmp::min(160u64 * 1024 * 1024, usize::MAX as u64) as usize)
             } else {
-                // HTTPS path: preserve original behavior (large upload). 4GB is set in load config.
+                // TLS upload path: large upload size (4GB) retained.
                 Direction::Up(4_000_000_000usize.min(usize::MAX))
             },
             rpm: 0.0,
@@ -146,7 +149,7 @@ impl Responsiveness {
         let env = Env { time, network };
         self.start = env.time.now();
 
-        if self.config.no_tls {
+    if self.config.no_tls_download {
             // Establish a dedicated warm self-probe connection (H1) so subsequent self probes
             // measure in-connection latency instead of including connect time. This is only
             // enabled for plain HTTP (--no-tls) mode. HTTPS code path remains unchanged from
@@ -316,7 +319,7 @@ impl Responsiveness {
                     shutdown.clone(),
                     &self.config.upload_url,
                     size,
-                    self.config.no_tls,
+                    self.config.no_tls_upload,
                 ) {
                     Ok(fut) => {
                         if let Err(e) = fut.await {
@@ -571,7 +574,7 @@ impl Responsiveness {
         env: &Env,
         shutdown: CancellationToken,
     ) -> anyhow::Result<bool> {
-        let inflight_body_fut = if self.config.no_tls {
+    let inflight_body_fut = if self.config.no_tls_download {
             // Plain HTTP path (no multiplexing). Reuse warm dedicated or a finished load, else new.
             if let Some(conn) = self.self_probe_connection.clone() {
                 ThroughputClient::download().plain_http_mode(true)
