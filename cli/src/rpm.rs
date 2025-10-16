@@ -25,15 +25,19 @@ use crate::util::pretty_secs_to_ms;
 pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
     info!("running responsiveness test");
 
+    // Global override: if --no-tls provided set all granular flags.
+    let effective_no_tls_download = cli_config.no_tls_all || cli_config.no_tls_download;
+    let effective_no_tls_upload = cli_config.no_tls_all || cli_config.no_tls_upload;
+    let effective_no_tls_latency = cli_config.no_tls_all || cli_config.no_tls_latency;
 
-    // Combined flag indicating any TLS disabling for remote config fetch purposes.
-    let any_no_tls = cli_config.no_tls_download || cli_config.no_tls_upload;
+    // Combined flag for remote config fetch: treat latency disable similarly (if latency wants plain HTTP, config may also be HTTP).
+    let any_no_tls = effective_no_tls_download || effective_no_tls_upload || effective_no_tls_latency;
+
     let rpm_urls = match cli_config.config.clone() {
         Some(endpoint) => {
             info!("fetching configuration from {endpoint}");
             let urls = get_rpm_config(endpoint, any_no_tls).await?.urls;
             info!("retrieved configuration urls: {urls:?}");
-
             urls
         }
         None => {
@@ -43,7 +47,6 @@ pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
                 https_upload_url: cli_config.upload_url,
             };
             info!("using default configuration urls: {urls:?}");
-
             urls
         }
     };
@@ -64,15 +67,15 @@ pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
         orig.to_string()
     };
 
-    if cli_config.no_tls_latency { latency_url = downgrade(&latency_url); info!("latency url downgraded: {} -> {}", rpm_urls.small_https_download_url, latency_url); }
-    if cli_config.no_tls_download {
+    if effective_no_tls_latency { latency_url = downgrade(&latency_url); info!("latency url downgraded: {} -> {}", rpm_urls.small_https_download_url, latency_url); }
+    if effective_no_tls_download {
         let old_small = small_download_url.clone();
         let old_large = large_download_url.clone();
         small_download_url = downgrade(&small_download_url);
         large_download_url = downgrade(&large_download_url);
         info!("download urls downgraded: small: {old_small} -> {small_download_url}, large: {old_large} -> {large_download_url}");
     }
-    if cli_config.no_tls_upload {
+    if effective_no_tls_upload {
         let old_upload = upload_url.clone();
         upload_url = downgrade(&upload_url);
         info!("upload url downgraded: {old_upload} -> {upload_url}");
@@ -83,7 +86,7 @@ pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
     let rtt_result = crate::latency::run_test(&LatencyConfig {
         url: latency_url.parse()?,
         runs: 20,
-        no_tls: cli_config.no_tls_latency,
+    no_tls: effective_no_tls_latency,
     })
     .await?;
     info!(
@@ -108,8 +111,8 @@ pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
         trimmed_mean_percent: cli_config.trimmed_mean_percent,
         std_tolerance: cli_config.std_tolerance,
         max_loaded_connections: cli_config.max_loaded_connections,
-        no_tls_download: cli_config.no_tls_download,
-        no_tls_upload: cli_config.no_tls_upload,
+        no_tls_download: effective_no_tls_download,
+        no_tls_upload: effective_no_tls_upload,
     };
 
     info!("running download test");

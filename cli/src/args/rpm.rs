@@ -78,6 +78,9 @@ pub struct RpmArgs {
     /// Disable TLS for unloaded latency RTT measurements only.
     #[clap(long = "no-tls-latency")]
     pub no_tls_latency: bool,
+    /// Disable TLS for all phases (equivalent to setting download, upload and latency flags).
+    #[clap(long = "no-tls")]
+    pub no_tls_all: bool,
 }
 
 impl Default for RpmArgs {
@@ -98,6 +101,7 @@ impl Default for RpmArgs {
             no_tls_download: false,
             no_tls_upload: false,
             no_tls_latency: false,
+            no_tls_all: false,
         }
     }
 }
