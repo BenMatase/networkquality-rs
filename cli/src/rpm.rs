@@ -86,7 +86,7 @@ pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
     let rtt_result = crate::latency::run_test(&LatencyConfig {
         url: latency_url.parse()?,
         runs: 20,
-    no_tls: effective_no_tls_latency,
+        no_tls: effective_no_tls_latency,
     })
     .await?;
     info!(

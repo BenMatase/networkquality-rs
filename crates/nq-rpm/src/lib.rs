@@ -99,7 +99,11 @@ pub struct Responsiveness {
 impl Responsiveness {
     fn connection_type(&self) -> ConnectionType {
         // Connection type determined by download path (GETs / probes)
-        if self.config.no_tls_download { ConnectionType::H1 } else { ConnectionType::H2 }
+        if self.direction == Direction::Down {
+            if self.config.no_tls_download { ConnectionType::H1 } else { ConnectionType::H2 }
+        } else {
+            if self.config.no_tls_upload { ConnectionType::H1 } else { ConnectionType::H2 }
+        }
     }
     pub fn new(config: ResponsivenessConfig, download: bool) -> anyhow::Result<Self> {
         let no_tls_upload = config.no_tls_upload; // used for direction logic
