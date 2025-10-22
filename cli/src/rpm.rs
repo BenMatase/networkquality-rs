@@ -159,7 +159,7 @@ async fn run_test(
     let network = Arc::new(TokioNetwork::new(
         Arc::clone(&time),
         shutdown.clone().into(),
-        config.no_tls_download, // network behavior for GET probes/load connections
+        if download { config.no_tls_download } else { config.no_tls_upload }, // network behavior for GET probes/load connections
     )) as Arc<dyn Network>;
 
     let rpm = Responsiveness::new(config.clone(), download)?;
