@@ -57,6 +57,7 @@ pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
     // Derive purpose-specific URLs without mutating originals.
     let mut latency_url = rpm_urls.small_https_download_url.clone();
     let mut small_download_url = rpm_urls.small_https_download_url.clone();
+    let mut small_download_for_upload_url = rpm_urls.small_https_download_url.clone();
     let mut large_download_url = rpm_urls.large_https_download_url.clone();
     let mut upload_url = rpm_urls.https_upload_url.clone();
 
@@ -76,10 +77,14 @@ pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
         info!("download urls downgraded: small: {old_small} -> {small_download_url}, large: {old_large} -> {large_download_url}");
     }
     if effective_no_tls_upload {
-        let old_upload = upload_url.clone();
+        let old_upload: String = upload_url.clone();
+        let old_small: String = small_download_for_upload_url.clone();
         upload_url = downgrade(&upload_url);
-        info!("upload url downgraded: {old_upload} -> {upload_url}");
+        small_download_for_upload_url = downgrade(&small_download_for_upload_url);
+        info!("upload url downgraded: small: {old_small} -> {small_download_for_upload_url}, large: {old_upload} -> {upload_url}");
     }
+
+    info!("small download for upload url: {}", small_download_for_upload_url);
 
     // first get unloaded RTT measurements
     info!("determining unloaded latency");
@@ -104,6 +109,7 @@ pub async fn run(cli_config: RpmArgs) -> anyhow::Result<()> {
     let config = ResponsivenessConfig {
         large_download_url: large_download_url.parse()?,
         small_download_url: small_download_url.parse()?,
+        small_download_for_upload_url: small_download_for_upload_url.parse()?,
         upload_url: upload_url.parse()?,
         moving_average_distance: cli_config.moving_average_distance,
         interval_duration: Duration::from_millis(cli_config.interval_duration_ms),
