@@ -27,6 +27,7 @@ use url::Url;
 pub struct ResponsivenessConfig {
     pub large_download_url: Url,
     pub small_download_url: Url,
+    pub small_download_for_upload_url: Url,
     pub upload_url: Url,
     pub moving_average_distance: usize,
     pub interval_duration: Duration,
@@ -34,7 +35,8 @@ pub struct ResponsivenessConfig {
     pub trimmed_mean_percent: f64,
     pub std_tolerance: f64,
     pub max_loaded_connections: usize,
-    pub no_tls: bool,
+    pub no_tls_download: bool,
+    pub no_tls_upload: bool,
 }
 
 impl ResponsivenessConfig {
@@ -47,7 +49,8 @@ impl ResponsivenessConfig {
             // When running in --no-tls mode we override this later when constructing the
             // Responsiveness instance for uploads.
             upload_size: 4_000_000_000, // 4 GB (legacy default)
-            no_tls: self.no_tls,
+            // Load-generating connections issue downloads first; use download flag.
+            no_tls: self.no_tls_download,
         }
     }
 }
@@ -61,6 +64,9 @@ impl Default for ResponsivenessConfig {
             small_download_url: "https://h3.speed.cloudflare.com/__down?bytes=10"
                 .parse()
                 .unwrap(),
+            small_download_for_upload_url: "https://h3.speed.cloudflare.com/__down?bytes=10"
+                .parse()
+                .unwrap(),
             upload_url: "https://h3.speed.cloudflare.com/__up"
                 .parse()
                 .unwrap(),
@@ -70,7 +76,8 @@ impl Default for ResponsivenessConfig {
             trimmed_mean_percent: 0.95,
             std_tolerance: 0.05,
             max_loaded_connections: 16,
-            no_tls: false,
+            no_tls_download: false,
+            no_tls_upload: false,
         }
     }
 }
@@ -88,17 +95,19 @@ pub struct Responsiveness {
     direction: Direction,
     rpm: f64,
     capacity: f64,
-    // Dedicated warm connection for self probes in non-multiplexed (H1) mode to avoid
-    // paying connection setup on every probe and inflating loaded latency.
-    self_probe_connection: Option<Arc<RwLock<EstablishedConnection>>>,
 }
 
 impl Responsiveness {
     fn connection_type(&self) -> ConnectionType {
-        if self.config.no_tls { ConnectionType::H1 } else { ConnectionType::H2 }
+        // Connection type determined by download path (GETs / probes)
+        if self.direction == Direction::Down {
+            if self.config.no_tls_download { ConnectionType::H1 } else { ConnectionType::H2 }
+        } else {
+            if self.config.no_tls_upload { ConnectionType::H1 } else { ConnectionType::H2 }
+        }
     }
     pub fn new(config: ResponsivenessConfig, download: bool) -> anyhow::Result<Self> {
-        let no_tls = config.no_tls; // capture before move
+        let no_tls_upload = config.no_tls_upload; // used for direction logic
         let load_generator = LoadGenerator::new(config.load_config())?;
 
         Ok(Self {
@@ -113,17 +122,15 @@ impl Responsiveness {
             rpm_saturated: false,
             direction: if download {
                 Direction::Down
-            } else if no_tls {
-                // In no-tls (plain HTTP) mode, use reduced synthetic upload size to avoid
-                // extremely long single-connection uploads and exercise self-probe behavior.
-                Direction::Up(std::cmp::min(16u64 * 1024 * 1024, usize::MAX as u64) as usize)
+            } else if no_tls_upload {
+                // Plain HTTP upload path: reduced synthetic upload size.
+                Direction::Up(std::cmp::min(160u64 * 1024 * 1024, usize::MAX as u64) as usize)
             } else {
-                // HTTPS path: preserve original behavior (large upload). 4GB is set in load config.
+                // TLS upload path: large upload size (4GB) retained.
                 Direction::Up(4_000_000_000usize.min(usize::MAX))
             },
             rpm: 0.0,
             capacity: 0.0,
-            self_probe_connection: None,
         })
     }
 }
@@ -145,29 +152,6 @@ impl Responsiveness {
     ) -> anyhow::Result<ResponsivenessResult> {
         let env = Env { time, network };
         self.start = env.time.now();
-
-        if self.config.no_tls {
-            // Establish a dedicated warm self-probe connection (H1) so subsequent self probes
-            // measure in-connection latency instead of including connect time. This is only
-            // enabled for plain HTTP (--no-tls) mode. HTTPS code path remains unchanged from
-            // original implementation.
-            if self.self_probe_connection.is_none() {
-                if let Ok(inflight) = ThroughputClient::download().plain_http_mode(true)
-                    .new_connection(ConnectionType::H1)
-                    .send(
-                        self.config.small_download_url.as_str().parse()?,
-                        Arc::clone(&env.network),
-                        Arc::clone(&env.time),
-                        shutdown.clone(),
-                    )?
-                    .await
-                {
-                    // Wait for the tiny body to finish to ensure connection is idle.
-                    let _ = wait_for_finish(inflight.events).await;
-                    self.self_probe_connection = Some(inflight.connection);
-                }
-            }
-        }
 
         info!("running responsiveness test: {:?}", self.config);
 
@@ -301,7 +285,35 @@ impl Responsiveness {
         if self.load_generator.count_loads() < self.config.max_loaded_connections
             && interval % 2 == 0
         {
-            self.new_load_generating_connection(event_tx, env, shutdown)?;
+            self.new_load_generating_connection(event_tx, env, shutdown.clone())?;
+        }
+
+        // Restart any finished upload connections to keep sustained upstream load.
+        // This avoids idle periods after a single large body completes (e.g., Cloudflare 413 limiting size).
+        for load in self.load_generator.loads_mut().iter_mut() {
+            if load.is_finished_upload() {
+                // Use original configured upload size (may have been reduced for no_tls).
+                let size = match self.direction { Direction::Up(sz) => sz, _ => continue };
+                match load.restart_upload(
+                    Arc::clone(&env.network),
+                    Arc::clone(&env.time),
+                    shutdown.clone(),
+                    &self.config.upload_url,
+                    size,
+                    self.config.no_tls_upload,
+                ) {
+                    Ok(fut) => {
+                        if let Err(e) = fut.await {
+                            error!("error restarting upload: {e}");
+                        } else {
+                            debug!("restarted finished upload connection");
+                        }
+                    }
+                    Err(e) => {
+                        error!("unable to initiate upload restart: {e}");
+                    }
+                }
+            }
         }
 
         let current_goodput = self.current_average_throughput(end_data_interval);
@@ -481,10 +493,18 @@ impl Responsiveness {
         env: &Env,
         shutdown: CancellationToken,
     ) -> anyhow::Result<()> {
+        let conn_type = self.connection_type();
+        let url = if self.direction == Direction::Down {
+            self.config.small_download_url.as_str().parse()?
+        } else {
+            self.config.small_download_for_upload_url.as_str().parse()?
+        };
+        debug!("sending foreign probe: conn_type={:?}, url={:?}", conn_type, url);
+
         let inflight_body_fut = ThroughputClient::download()
-            .new_connection(self.connection_type())
+            .new_connection(conn_type)
             .send(
-                self.config.small_download_url.as_str().parse()?,
+                url,
                 Arc::clone(&env.network),
                 Arc::clone(&env.time),
                 shutdown,
@@ -543,59 +563,41 @@ impl Responsiveness {
         env: &Env,
         shutdown: CancellationToken,
     ) -> anyhow::Result<bool> {
-        let inflight_body_fut = if self.config.no_tls {
-            // Plain HTTP path (no multiplexing). Reuse warm dedicated or a finished load, else new.
-            if let Some(conn) = self.self_probe_connection.clone() {
-                ThroughputClient::download().plain_http_mode(true)
-                    .with_connection(conn)
-                    .send(
-                        self.config.small_download_url.as_str().parse()?,
-                        Arc::clone(&env.network),
-                        Arc::clone(&env.time),
-                        shutdown.clone(),
-                    )?
-            } else if let Some(conn) = self.load_generator.random_finished_connection() {
-                ThroughputClient::download().plain_http_mode(true)
-                    .with_connection(conn)
-                    .send(
-                        self.config.small_download_url.as_str().parse()?,
-                        Arc::clone(&env.network),
-                        Arc::clone(&env.time),
-                        shutdown.clone(),
-                    )?
-            } else {
-                ThroughputClient::download().plain_http_mode(true)
-                    .new_connection(self.connection_type())
-                    .send(
-                        self.config.small_download_url.as_str().parse()?,
-                        Arc::clone(&env.network),
-                        Arc::clone(&env.time),
-                        shutdown,
-                    )?
-            }
+
+        let conn_type = self.connection_type();
+        let url = if self.direction == Direction::Down {
+            self.config.small_download_url.as_str().parse()?
         } else {
-            // HTTPS path with H2 multiplexing enabled: attempt to reuse an ongoing load connection.
-            if let Some(conn) = self.load_generator.random_connection() {
-                ThroughputClient::download().plain_http_mode(false)
-                    .with_connection(conn)
-                    .send(
-                        self.config.small_download_url.as_str().parse()?,
-                        Arc::clone(&env.network),
-                        Arc::clone(&env.time),
-                        shutdown.clone(),
-                    )?
-            } else {
-                // If no ongoing load yet, create a new one of the configured type (H2).
-                ThroughputClient::download().plain_http_mode(false)
-                    .new_connection(self.connection_type())
-                    .send(
-                        self.config.small_download_url.as_str().parse()?,
-                        Arc::clone(&env.network),
-                        Arc::clone(&env.time),
-                        shutdown,
-                    )?
-            }
+            self.config.small_download_for_upload_url.as_str().parse()?
         };
+        debug!("sending self probe: conn_type={:?}, url={:?}", conn_type, url);
+
+        let plain_http = conn_type == ConnectionType::H1;
+        debug!("no load-generating connection available for self probe, creating new connection");
+
+        let inflight_body_fut =
+        // HTTPS path with H2 multiplexing enabled: attempt to reuse an ongoing load connection.
+        // if let Some(conn) = self.load_generator.random_connection() {
+        //     debug!("using load-generating connection for self probe: {:?}", conn);
+        //     ThroughputClient::download().plain_http_mode(plain_http)
+        //         .with_connection(conn)
+        //         .send(
+        //             url,
+        //             Arc::clone(&env.network),
+        //             Arc::clone(&env.time),
+        //             shutdown.clone(),
+        //         )?
+        // } else {
+            // If no ongoing load yet, create a new one of the configured type (H2).
+            ThroughputClient::download().plain_http_mode(plain_http)
+                .new_connection(conn_type)
+                .send(
+                    url,
+                    Arc::clone(&env.network),
+                    Arc::clone(&env.time),
+                    shutdown,
+                )?;
+        // };
 
         tokio::spawn(report_err(
             event_tx.clone(),

@@ -71,8 +71,16 @@ pub struct RpmArgs {
     pub disable_aim_scores: bool,
     /// Disable TLS for H1 connections (plain TCP). When set, HTTP/1.1 is used
     /// without a TLS handshake; otherwise HTTP/2 is preferred.
+    #[clap(long = "no-tls-download")]
+    pub no_tls_download: bool,
+    #[clap(long = "no-tls-upload")]
+    pub no_tls_upload: bool,
+    /// Disable TLS for unloaded latency RTT measurements only.
+    #[clap(long = "no-tls-latency")]
+    pub no_tls_latency: bool,
+    /// Disable TLS for all phases (equivalent to setting download, upload and latency flags).
     #[clap(long = "no-tls")]
-    pub no_tls: bool,
+    pub no_tls_all: bool,
 }
 
 impl Default for RpmArgs {
@@ -90,7 +98,10 @@ impl Default for RpmArgs {
             interval_duration_ms: 1000, // 1s
             test_duration_ms: 12_000,   // 12s
             disable_aim_scores: false,
-            no_tls: false,
+            no_tls_download: false,
+            no_tls_upload: false,
+            no_tls_latency: false,
+            no_tls_all: false,
         }
     }
 }
