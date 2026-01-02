@@ -36,7 +36,7 @@ pub enum Direction {
     /// Saturate the upload (egress) side of the network.
     Up {
         /// The URL to upload data to.
-        #[clap(short, long, default_value = "http://speed.cloudflare.com/__up")]
+        #[clap(short, long, default_value = "https://speed.cloudflare.com/__up")]
         upload_url: String,
     },
     /// Saturate both the download (ingress) and upload (egress) side of the network.
@@ -49,7 +49,7 @@ pub enum Direction {
         )]
         download_url: String,
         /// The URL to upload data to.
-        #[clap(short, long, default_value = "http://speed.cloudflare.com/__up")]
+        #[clap(short, long, default_value = "https://speed.cloudflare.com/__up")]
         upload_url: String,
     },
 }
